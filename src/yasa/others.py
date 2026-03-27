@@ -484,6 +484,13 @@ def get_centered_indices(data, idx, npts_before, npts_after):
     idx_ep = np.ma.compress_rows(idx_ep)
     return idx_ep, idx_ep_nomask
 
+def get_event_indices(idx_start, idx_end):
+    assert idx_start.shape == idx_end.shape, f"idx_start, idx_end should have the same shape (Got {idx_start.shape} and {idx_end.shape})"
+    assert len(idx_start.shape) == 1, f"idx_start, idx_end should be 1D array (Got {idx_start.shape} and {idx_end.shape})"
+    idx_start = np.squeeze(idx_start)
+    idx_end = np.squeeze(idx_end)
+    
+    return np.array([range(s, e) for s, e in zip(idx_start, idx_end)], dtype=object)
 
 def _norm_direct_pac(pha, amp, p=0.05):
     """Normalized direct PAC (ndPAC).

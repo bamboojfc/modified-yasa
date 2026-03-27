@@ -32,6 +32,7 @@ from .others import (
     moving_transform,
     sliding_window,
     trimbothstd,
+    get_event_indices,
 )
 from .spectral import stft_power
 
@@ -1453,7 +1454,7 @@ def sw_detect(
     amp_pos=(10, 150),
     amp_ptp=(75, 350),
     coupling=False,
-    coupling_params={"freq_sp": (12, 16), "time": 1, "p": 0.05},
+    coupling_params={"freq_sp": (12, 16)},
     remove_outliers=False,
     verbose=False,
 ):
@@ -1572,14 +1573,7 @@ def sw_detect(
         * ``freq_sp`` is a tuple or list that defines the spindles-related frequency of interest.
           The default is 12 to 16 Hz, with a wide transition bandwidth of 1.5 Hz.
 
-        * ``time`` is an int or a float that defines the time around the negative peak of each
-          detected slow-waves, in seconds. For example, a value of 1 means that the coupling will
-          be calculated for each slow-waves using a 2-seconds epoch centered around the negative
-          peak of the slow-waves (i.e. 1 second on each side).
-
-        * ``p`` is the p-value used for thresholding of unreliable coupling values (ndPAC).
-          Sub-threshold PAC values will be set to 0. To disable this behavior (no masking),
-          use ``p=1`` or ``p=None``.
+        * (time and p were removed)
 
         .. versionadded:: 0.6.0
 
@@ -1718,8 +1712,8 @@ def sw_detect(
         # https://doi.org/10.1016/j.conb.2014.08.002
         assert isinstance(coupling_params, dict)
         assert "freq_sp" in coupling_params.keys()
-        assert "time" in coupling_params.keys()
-        assert "p" in coupling_params.keys()
+        assert "time" not in coupling_params.keys(), "`time` parameter was removed"
+        assert "p" not in coupling_params.keys(), "`p` parameter was removed"
         freq_sp = coupling_params["freq_sp"]
         data_sp = filter_data(
             data,
@@ -1888,44 +1882,31 @@ def sw_detect(
         # Add phase (in radians) of slow-oscillation signal at maximum
         # spindles-related sigma amplitude within a XX-seconds centered epochs.
         if coupling:
-            # Get phase and amplitude for each centered epoch
-            time_before = time_after = coupling_params["time"]
-            assert float(sf * time_before).is_integer(), (
-                "Invalid time parameter for coupling. Must be a whole number of samples."
-            )
-            bef = int(sf * time_before)
-            aft = int(sf * time_after)
-            # Center of each epoch is defined as the negative peak of the SW
+            idx_sw_start = (sf * sw_start).astype(int)
+            idx_sw_end = (sf * sw_end).astype(int)
             n_peaks = idx_neg_peaks.shape[0]
-            # idx.shape = (len(idx_valid), bef + aft + 1)
-            idx, idx_valid = get_centered_indices(data[i, :], idx_neg_peaks, bef, aft)
-            sw_pha_ev = sw_pha[i, idx]
-            sp_amp_ev = sp_amp[i, idx]
+            idx = get_event_indices(idx_sw_start, idx_sw_end)
+            
+            sw_pha_ev = [sw_pha[0, r] for r in idx]
+            sp_amp_ev = [sp_amp[0, r] for r in idx]
+            assert len(sw_pha_ev) == n_peaks
+            assert len(sp_amp_ev) == n_peaks
+            
             # 1) Find location of max sigma amplitude in epoch
-            idx_max_amp = sp_amp_ev.argmax(axis=1)
-            # Now we need to append it back to the original unmasked shape
-            # to avoid error when idx.shape[0] != idx_valid.shape, i.e.
-            # some epochs were out of data bounds.
-            sw_params["SigmaPeak"] = np.ones(n_peaks) * np.nan
-            # Timestamp at sigma peak, expressed in seconds from negative peak
-            # e.g. -0.39, 0.5, 1, 2 -- limits are [time_before, time_after]
-            time_sigpk = (idx_max_amp - bef) / sf
-            # convert to absolute time from beginning of the recording
-            # time_sigpk only includes valid epoch
-            time_sigpk_abs = sw_idx_neg[idx_valid] + time_sigpk
-            sw_params["SigmaPeak"][idx_valid] = time_sigpk_abs
+            idx_max_amp = np.array([each_sp_amp.argmax() for each_sp_amp in sp_amp_ev])
+            assert idx_max_amp.shape[0] == n_peaks
+            
+            # Timestamp at sigma peak, expressed in seconds 
+            time_sigpk_abs = (idx_sw_start + idx_max_amp) / sf
+            sw_params["SigmaPeak"] = time_sigpk_abs
+            assert np.all(time_sigpk_abs[_] <= sw_end[_] and time_sigpk_abs[_] >= sw_start[_] for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
+            sw_params["SigmaPeakAmp"] = np.array([sp_amp_ev[_][idx_max_amp[_]] for _ in range(n_peaks)])
+            
             # 2) PhaseAtSigmaPeak
             # Find SW phase at max sigma amplitude in epoch
-            pha_at_max = np.squeeze(np.take_along_axis(sw_pha_ev, idx_max_amp[..., None], axis=1))
-            sw_params["PhaseAtSigmaPeak"] = np.ones(n_peaks) * np.nan
-            sw_params["PhaseAtSigmaPeak"][idx_valid] = pha_at_max
-            # 3) Normalized Direct PAC, with thresholding
-            # Unreliable values are set to 0
-            ndp = np.squeeze(
-                _norm_direct_pac(sw_pha_ev[None, ...], sp_amp_ev[None, ...], p=coupling_params["p"])
-            )
-            sw_params["ndPAC"] = np.ones(n_peaks) * np.nan
-            sw_params["ndPAC"][idx_valid] = ndp
+            pha_at_max = np.array([sw_pha_ev[_][idx_max_amp[_]] for _ in range(n_peaks)])
+            sw_params["PhaseAtSigmaPeak"] = pha_at_max
+
             # Make sure that Stage is the last column of the dataframe
             sw_params.move_to_end("Stage")
 
