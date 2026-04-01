@@ -35,6 +35,7 @@ from .others import (
     get_event_indices,
 )
 from .spectral import stft_power
+from .bursts import detect_spindle_bursts, mapping_so_bursts
 
 logger = logging.getLogger("yasa")
 
@@ -1454,7 +1455,7 @@ def sw_detect(
     amp_pos=(10, 150),
     amp_ptp=(75, 350),
     coupling=False,
-    coupling_params={"freq_sp": (12, 16)},
+    coupling_params={"freq_sp": (12, 16), "burst_overlapping_so_criterion": 0.5},
     remove_outliers=False,
     verbose=False,
 ):
@@ -1575,7 +1576,8 @@ def sw_detect(
 
         * (time and p were removed)
 
-        .. versionadded:: 0.6.0
+        * ``burst_overlapping_so_criterion`` is a float that defines the criterion to consider that a spindle burst overlaps with a slow-wave. 
+        The default is 0.5, meaning that at least 50% of the spindle burst duration must overlap with the slow-wave duration to be considered as overlapping.
 
     remove_outliers : boolean
         If True, YASA will automatically detect and remove outliers slow-waves
@@ -1712,6 +1714,7 @@ def sw_detect(
         # https://doi.org/10.1016/j.conb.2014.08.002
         assert isinstance(coupling_params, dict)
         assert "freq_sp" in coupling_params.keys()
+        assert "burst_overlapping_so_criterion" in coupling_params.keys()
         assert "time" not in coupling_params.keys(), "`time` parameter was removed"
         assert "p" not in coupling_params.keys(), "`p` parameter was removed"
         freq_sp = coupling_params["freq_sp"]
@@ -1882,30 +1885,42 @@ def sw_detect(
         # Add phase (in radians) of slow-oscillation signal at maximum
         # spindles-related sigma amplitude within a XX-seconds centered epochs.
         if coupling:
-            idx_sw_start = (sf * sw_start).astype(int)
-            idx_sw_end = (sf * sw_end).astype(int)
+            burst_starts, burst_ends, burst_peaks_indices = detect_spindle_bursts(
+                envelope=sp_amp[i, :],
+                sfreq=sf,
+            )
+            
+            burst_overlapping_so_criterion = coupling_params["burst_overlapping_so_criterion"]
+            sigma_peaks_indices = mapping_so_bursts(
+                so_starts=sw_start * sf,
+                so_ends=sw_end * sf,
+                burst_starts=burst_starts,
+                burst_ends=burst_ends,
+                burst_peaks_indices=burst_peaks_indices,
+                burst_envelope=sp_amp[i, :],
+                burst_overlapping_so_criterion=burst_overlapping_so_criterion,
+            )
+            
+            # for each event, get PhaseAtSigmaPeak if there is matching burst, and np.nan if there is no matching burst
             n_peaks = idx_neg_peaks.shape[0]
-            idx = get_event_indices(idx_sw_start, idx_sw_end)
+            assert len(sigma_peaks_indices) == n_peaks, "Each slow-wave should be associated with one spindle burst (or no burst)."
             
-            sw_pha_ev = [sw_pha[0, r] for r in idx]
-            sp_amp_ev = [sp_amp[0, r] for r in idx]
-            assert len(sw_pha_ev) == n_peaks
-            assert len(sp_amp_ev) == n_peaks
-            
-            # 1) Find location of max sigma amplitude in epoch
-            idx_max_amp = np.array([each_sp_amp.argmax() for each_sp_amp in sp_amp_ev])
-            assert idx_max_amp.shape[0] == n_peaks
+            sw_pha_ev = []
+            sp_amp_ev = []
+            for r in sigma_peaks_indices:
+                if np.isfinite(r):
+                    sw_pha_ev.append(sw_pha[i, int(r)])
+                    sp_amp_ev.append(sp_amp[i, int(r)])
+                else:
+                    sw_pha_ev.append(np.nan)
+                    sp_amp_ev.append(np.nan)
             
             # Timestamp at sigma peak, expressed in seconds 
-            time_sigpk_abs = (idx_sw_start + idx_max_amp) / sf
+            time_sigpk_abs = sigma_peaks_indices / sf
             sw_params["SigmaPeak"] = time_sigpk_abs
-            assert np.all(time_sigpk_abs[_] <= sw_end[_] and time_sigpk_abs[_] >= sw_start[_] for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
-            sw_params["SigmaPeakAmp"] = np.array([sp_amp_ev[_][idx_max_amp[_]] for _ in range(n_peaks)])
-            
-            # 2) PhaseAtSigmaPeak
-            # Find SW phase at max sigma amplitude in epoch
-            pha_at_max = np.array([sw_pha_ev[_][idx_max_amp[_]] for _ in range(n_peaks)])
-            sw_params["PhaseAtSigmaPeak"] = pha_at_max
+            assert np.all((np.isnan(sigma_peaks_indices[_]) or time_sigpk_abs[_] <= sw_end[_] and time_sigpk_abs[_] >= sw_start[_]) for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
+            sw_params["SigmaPeakAmp"] = sp_amp_ev
+            sw_params["PhaseAtSigmaPeak"] = sw_pha_ev
 
             # Make sure that Stage is the last column of the dataframe
             sw_params.move_to_end("Stage")
