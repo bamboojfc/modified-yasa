@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.signal import find_peaks
+from tqdm import tqdm
 
 def detect_spindle_bursts(
     envelope: np.ndarray,
@@ -96,8 +97,8 @@ def detect_spindle_bursts(
             burst_ends.append(right)
             peak_indices.append(each_peak_idx)
 
-    print("peak_indices:", peak_indices)
-    print("peak time (s):", [idx / sfreq for idx in peak_indices])
+    # print("peak_indices:", peak_indices)
+    # print("peak time (s):", [idx / sfreq for idx in peak_indices])
     return np.array(burst_starts), np.array(burst_ends), np.array(peak_indices)
 
 def mapping_so_bursts(
@@ -141,7 +142,7 @@ def mapping_so_bursts(
 
     sigma_peaks_indices = np.full_like(so_starts, fill_value=np.nan, dtype=np.float64)
 
-    for i, (so_s, so_e) in enumerate(zip(so_starts, so_ends)):
+    for i, (so_s, so_e) in tqdm(enumerate(zip(so_starts, so_ends))):
         # Find bursts that overlap with the current SO
         overlapping_bursts = []
         for j in range(0, len(burst_starts)):
