@@ -10,6 +10,7 @@ slow-waves, and rapid eye movements from sleep EEG recordings.
 import logging
 from collections import OrderedDict
 from itertools import product
+from tqdm import tqdm
 
 import mne
 import numpy as np
@@ -36,6 +37,7 @@ from .others import (
 )
 from .spectral import stft_power
 from .bursts import detect_spindle_bursts, mapping_so_bursts
+from .expanded_phase import get_sw_pha_unwrapped
 
 logger = logging.getLogger("yasa")
 
@@ -1731,6 +1733,9 @@ def sw_detect(
         # Now extract the instantaneous phase/amplitude using Hilbert transform
         sw_pha = np.angle(signal.hilbert(data_filt, N=nfast)[:, :n_samples])
         sp_amp = np.abs(signal.hilbert(data_sp, N=nfast)[:, :n_samples])
+        
+        # For expanded phase
+        sw_pha_unwrapped = np.unwrap(sw_pha, axis=-1)
 
     # Initialize empty output dataframe
     df = pd.DataFrame()
@@ -1801,14 +1806,25 @@ def sw_detect(
         pos_sorted = np.searchsorted(zero_crossings, idx_pos_peaks)
         previous_pos_zc = zero_crossings[pos_sorted - 1] - idx_pos_peaks
         following_pos_zc = zero_crossings[pos_sorted] - idx_pos_peaks
+        
+        # Get the expanded phases (from 2pi to 4pi)
+        neg_sorted_expanded = np.array([neg_sorted[_idx]-2 if _idx > 1 else neg_sorted[_idx]-1 for _idx in range(len(neg_sorted))]) # to deal with the first phase
+        previous_neg_zc_expanded = zero_crossings[neg_sorted_expanded] - idx_neg_peaks
+        pos_sorted_expanded = np.array([pos_sorted[_idx]+1 if _idx < len(pos_sorted)-2 else pos_sorted[_idx] for _idx in range(len(pos_sorted))]) # to deal with the last phase
+        following_pos_zc_expanded = zero_crossings[pos_sorted_expanded] - idx_pos_peaks
 
         # Duration of the negative and positive phases, in seconds
-        neg_phase_dur = (np.abs(previous_neg_zc) + following_neg_zc) / sf
-        pos_phase_dur = (np.abs(previous_pos_zc) + following_pos_zc) / sf
+        neg_phase_dur = (np.abs(previous_neg_zc) + following_neg_zc) / sf 
+        pos_phase_dur = (np.abs(previous_pos_zc) + following_pos_zc) / sf 
 
         # We now compute a set of metrics
         sw_start = times[idx_neg_peaks + previous_neg_zc]
         sw_end = times[idx_pos_peaks + following_pos_zc]
+        
+        # each sw_start has sw_start_expanded and sw_end has sw_end_expanded
+        sw_start_expanded = times[idx_neg_peaks + previous_neg_zc_expanded]
+        sw_end_expanded = times[idx_pos_peaks + following_pos_zc_expanded]
+        
         # This should be the same as `sw_dur = pos_phase_dur + neg_phase_dur`
         # We round to avoid floating point errr (e.g. 1.9000000002)
         sw_dur = (sw_end - sw_start).round(4)
@@ -1863,6 +1879,10 @@ def sw_detect(
         sw_ptp = sw_ptp[good_sw]
         sw_slope = sw_slope[good_sw]
         sw_sta = sw_sta[good_sw]
+        
+        # select the expanded SO based on the real SO
+        sw_start_expanded = sw_start_expanded[good_sw]
+        sw_end_expanded = sw_end_expanded[good_sw]
 
         # Create a dictionnary
         sw_params = OrderedDict(
@@ -1872,6 +1892,8 @@ def sw_detect(
                 "MidCrossing": sw_midcrossing,
                 "PosPeak": sw_idx_pos,
                 "End": sw_end,
+                "ExpandedStart": sw_start_expanded,
+                "ExpandedEnd": sw_end_expanded,
                 "Duration": sw_dur,
                 "ValNegPeak": data_filt[i, idx_neg_peaks],
                 "ValPosPeak": data_filt[i, idx_pos_peaks],
@@ -1892,8 +1914,8 @@ def sw_detect(
             
             burst_overlapping_so_criterion = coupling_params["burst_overlapping_so_criterion"]
             sigma_peaks_indices = mapping_so_bursts(
-                so_starts=sw_start * sf,
-                so_ends=sw_end * sf,
+                so_starts=sw_start_expanded * sf,
+                so_ends=sw_end_expanded * sf,
                 burst_starts=burst_starts,
                 burst_ends=burst_ends,
                 burst_peaks_indices=burst_peaks_indices,
@@ -1907,10 +1929,20 @@ def sw_detect(
             
             sw_pha_ev = []
             sp_amp_ev = []
-            for r in sigma_peaks_indices:
-                if np.isfinite(r):
-                    sw_pha_ev.append(sw_pha[i, int(r)])
-                    sp_amp_ev.append(sp_amp[i, int(r)])
+            for s_idx in tqdm(range(len(sigma_peaks_indices)), "Getting expanded phase.."):
+                if np.isfinite(sigma_peaks_indices[s_idx]):
+                    peak_idx = int(sigma_peaks_indices[s_idx])
+                    _sw_pha = get_sw_pha_unwrapped(
+                        sw_pha_unwrapped=sw_pha_unwrapped[i],
+                        peak_index=peak_idx,
+                        sw_target_start=sw_start[s_idx] * sf,
+                        sw_target_end=sw_end[s_idx] * sf,
+                        sw_midcrossing=sw_midcrossing[s_idx] * sf,
+                        sw_expanded_start=sw_start_expanded[s_idx] * sf,
+                        sw_expanded_end=sw_end_expanded[s_idx] * sf,
+                    )
+                    sw_pha_ev.append(_sw_pha)
+                    sp_amp_ev.append(sp_amp[i, peak_idx])
                 else:
                     sw_pha_ev.append(np.nan)
                     sp_amp_ev.append(np.nan)
@@ -1918,7 +1950,7 @@ def sw_detect(
             # Timestamp at sigma peak, expressed in seconds 
             time_sigpk_abs = sigma_peaks_indices / sf
             sw_params["SigmaPeak"] = time_sigpk_abs
-            assert np.all((np.isnan(sigma_peaks_indices[_]) or time_sigpk_abs[_] <= sw_end[_] and time_sigpk_abs[_] >= sw_start[_]) for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
+            assert np.all((np.isnan(sigma_peaks_indices[_]) or time_sigpk_abs[_] <= sw_end_expanded[_] and time_sigpk_abs[_] >= sw_start_expanded[_]) for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
             sw_params["SigmaPeakAmp"] = sp_amp_ev
             sw_params["PhaseAtSigmaPeak"] = sw_pha_ev
 
