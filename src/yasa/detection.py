@@ -1808,11 +1808,11 @@ def sw_detect(
         following_pos_zc = zero_crossings[pos_sorted] - idx_pos_peaks
         
         # Get the expanded phases (from 2pi to 4pi)
-        neg_sorted_expanded = np.array([neg_sorted[_idx]-2 if _idx > 1 else neg_sorted[_idx]-1 for _idx in range(len(neg_sorted))]) # to deal with the first phase
+        neg_sorted_expanded = np.clip(neg_sorted - 2, 0, len(zero_crossings) - 1)
+        pos_sorted_expanded = np.clip(pos_sorted + 1, 0, len(zero_crossings) - 1)
         previous_neg_zc_expanded = zero_crossings[neg_sorted_expanded] - idx_neg_peaks
-        pos_sorted_expanded = np.array([pos_sorted[_idx]+1 if _idx < len(pos_sorted)-2 else pos_sorted[_idx] for _idx in range(len(pos_sorted))]) # to deal with the last phase
         following_pos_zc_expanded = zero_crossings[pos_sorted_expanded] - idx_pos_peaks
-
+        
         # Duration of the negative and positive phases, in seconds
         neg_phase_dur = (np.abs(previous_neg_zc) + following_neg_zc) / sf 
         pos_phase_dur = (np.abs(previous_pos_zc) + following_pos_zc) / sf 
