@@ -1457,7 +1457,7 @@ def sw_detect(
     amp_pos=(10, 150),
     amp_ptp=(75, 350),
     coupling=False,
-    coupling_params={"freq_sp": (12, 16), "burst_overlapping_so_criterion": 0.5},
+    coupling_params={"freq_sp": (12, 16), "burst_overlapping_so_criterion": 0.5, "expanded_phase": False},
     remove_outliers=False,
     verbose=False,
 ):
@@ -1580,6 +1580,9 @@ def sw_detect(
 
         * ``burst_overlapping_so_criterion`` is a float that defines the criterion to consider that a spindle burst overlaps with a slow-wave. 
         The default is 0.5, meaning that at least 50% of the spindle burst duration must overlap with the slow-wave duration to be considered as overlapping.
+        
+        * ``expanded_phase`` is a boolean that defines whether we allows the coupling to occur beyond the duration of the slow-wave. 
+        If False (default), the coupling is only calculated within the slow-wave event. If True, the coupling is calculated within half cycle before and after the slow-wave event.
 
     remove_outliers : boolean
         If True, YASA will automatically detect and remove outliers slow-waves
@@ -1717,9 +1720,11 @@ def sw_detect(
         assert isinstance(coupling_params, dict)
         assert "freq_sp" in coupling_params.keys()
         assert "burst_overlapping_so_criterion" in coupling_params.keys()
+        assert "expanded_phase" in coupling_params.keys()
         assert "time" not in coupling_params.keys(), "`time` parameter was removed"
         assert "p" not in coupling_params.keys(), "`p` parameter was removed"
         freq_sp = coupling_params["freq_sp"]
+        expanded_phase = coupling_params["expanded_phase"]
         data_sp = filter_data(
             data,
             sf,
@@ -1735,7 +1740,8 @@ def sw_detect(
         sp_amp = np.abs(signal.hilbert(data_sp, N=nfast)[:, :n_samples])
         
         # For expanded phase
-        sw_pha_unwrapped = np.unwrap(sw_pha, axis=-1)
+        if expanded_phase:
+            sw_pha_unwrapped = np.unwrap(sw_pha, axis=-1)
 
     # Initialize empty output dataframe
     df = pd.DataFrame()
@@ -1807,11 +1813,12 @@ def sw_detect(
         previous_pos_zc = zero_crossings[pos_sorted - 1] - idx_pos_peaks
         following_pos_zc = zero_crossings[pos_sorted] - idx_pos_peaks
         
-        # Get the expanded phases (from 2pi to 4pi)
-        neg_sorted_expanded = np.clip(neg_sorted - 2, 0, len(zero_crossings) - 1)
-        pos_sorted_expanded = np.clip(pos_sorted + 1, 0, len(zero_crossings) - 1)
-        previous_neg_zc_expanded = zero_crossings[neg_sorted_expanded] - idx_neg_peaks
-        following_pos_zc_expanded = zero_crossings[pos_sorted_expanded] - idx_pos_peaks
+        if expanded_phase:
+            # Get the expanded phases (from 2pi to 4pi)
+            neg_sorted_expanded = np.clip(neg_sorted - 2, 0, len(zero_crossings) - 1)
+            pos_sorted_expanded = np.clip(pos_sorted + 1, 0, len(zero_crossings) - 1)
+            previous_neg_zc_expanded = zero_crossings[neg_sorted_expanded] - idx_neg_peaks
+            following_pos_zc_expanded = zero_crossings[pos_sorted_expanded] - idx_pos_peaks
         
         # Duration of the negative and positive phases, in seconds
         neg_phase_dur = (np.abs(previous_neg_zc) + following_neg_zc) / sf 
@@ -1821,9 +1828,10 @@ def sw_detect(
         sw_start = times[idx_neg_peaks + previous_neg_zc]
         sw_end = times[idx_pos_peaks + following_pos_zc]
         
-        # each sw_start has sw_start_expanded and sw_end has sw_end_expanded
-        sw_start_expanded = times[idx_neg_peaks + previous_neg_zc_expanded]
-        sw_end_expanded = times[idx_pos_peaks + following_pos_zc_expanded]
+        if expanded_phase:
+            # each sw_start has sw_start_expanded and sw_end has sw_end_expanded
+            sw_start_expanded = times[idx_neg_peaks + previous_neg_zc_expanded]
+            sw_end_expanded = times[idx_pos_peaks + following_pos_zc_expanded]
         
         # This should be the same as `sw_dur = pos_phase_dur + neg_phase_dur`
         # We round to avoid floating point errr (e.g. 1.9000000002)
@@ -1880,9 +1888,13 @@ def sw_detect(
         sw_slope = sw_slope[good_sw]
         sw_sta = sw_sta[good_sw]
         
-        # select the expanded SO based on the real SO
-        sw_start_expanded = sw_start_expanded[good_sw]
-        sw_end_expanded = sw_end_expanded[good_sw]
+        if expanded_phase:
+            # select the expanded SO based on the real SO
+            sw_start_expanded = sw_start_expanded[good_sw]
+            sw_end_expanded = sw_end_expanded[good_sw]
+        else:
+            sw_start_expanded = [None] * len(sw_start)
+            sw_end_expanded = [None] * len(sw_end)
 
         # Create a dictionnary
         sw_params = OrderedDict(
@@ -1913,9 +1925,17 @@ def sw_detect(
             )
             
             burst_overlapping_so_criterion = coupling_params["burst_overlapping_so_criterion"]
+            
+            if expanded_phase:
+                so_starts = sw_start_expanded
+                so_ends = sw_end_expanded
+            else:
+                so_starts = sw_start
+                so_ends = sw_end
+                
             sigma_peaks_indices = mapping_so_bursts(
-                so_starts=sw_start_expanded * sf,
-                so_ends=sw_end_expanded * sf,
+                so_starts=so_starts * sf,
+                so_ends=so_ends * sf,
                 burst_starts=burst_starts,
                 burst_ends=burst_ends,
                 burst_peaks_indices=burst_peaks_indices,
@@ -1932,15 +1952,19 @@ def sw_detect(
             for s_idx in tqdm(range(len(sigma_peaks_indices)), "Getting expanded phase.."):
                 if np.isfinite(sigma_peaks_indices[s_idx]):
                     peak_idx = int(sigma_peaks_indices[s_idx])
-                    _sw_pha = get_sw_pha_unwrapped(
-                        sw_pha_unwrapped=sw_pha_unwrapped[i],
-                        peak_index=peak_idx,
-                        sw_target_start=sw_start[s_idx] * sf,
-                        sw_target_end=sw_end[s_idx] * sf,
-                        sw_midcrossing=sw_midcrossing[s_idx] * sf,
-                        sw_expanded_start=sw_start_expanded[s_idx] * sf,
-                        sw_expanded_end=sw_end_expanded[s_idx] * sf,
-                    )
+                    if expanded_phase:
+                        _sw_pha = get_sw_pha_unwrapped(
+                            sw_pha_unwrapped=sw_pha_unwrapped[i],
+                            peak_index=peak_idx,
+                            sw_target_start=sw_start[s_idx] * sf,
+                            sw_target_end=sw_end[s_idx] * sf,
+                            sw_midcrossing=sw_midcrossing[s_idx] * sf,
+                            sw_expanded_start=sw_start_expanded[s_idx] * sf,
+                            sw_expanded_end=sw_end_expanded[s_idx] * sf,
+                        )
+                    else:
+                        _sw_pha = sw_pha[i, peak_idx]
+                        
                     sw_pha_ev.append(_sw_pha)
                     sp_amp_ev.append(sp_amp[i, peak_idx])
                 else:
@@ -1950,7 +1974,10 @@ def sw_detect(
             # Timestamp at sigma peak, expressed in seconds 
             time_sigpk_abs = sigma_peaks_indices / sf
             sw_params["SigmaPeak"] = time_sigpk_abs
-            assert np.all((np.isnan(sigma_peaks_indices[_]) or time_sigpk_abs[_] <= sw_end_expanded[_] and time_sigpk_abs[_] >= sw_start_expanded[_]) for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
+            if expanded_phase:
+                assert np.all((np.isnan(sigma_peaks_indices[_]) or time_sigpk_abs[_] <= sw_end_expanded[_] and time_sigpk_abs[_] >= sw_start_expanded[_]) for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
+            else:
+                assert np.all((np.isnan(sigma_peaks_indices[_]) or time_sigpk_abs[_] <= sw_end[_] and time_sigpk_abs[_] >= sw_start[_]) for _ in range(n_peaks)), "SigmaPeak is outside an SO event."
             sw_params["SigmaPeakAmp"] = sp_amp_ev
             sw_params["PhaseAtSigmaPeak"] = sw_pha_ev
 
