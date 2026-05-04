@@ -166,8 +166,16 @@ def mapping_so_bursts(
                 })
 
         if len(overlapping_bursts) > 0:
-            # If multiple bursts overlap with the SO, select the one with the most overlap
-            best_burst_idx = np.argmax([b['overlap_percentage'] for b in overlapping_bursts])
+            # If multiple bursts overlap with the SO, select the one with the highest peak value
+            best_burst_idx = np.argmax([b['peak_value'] for b in overlapping_bursts])
+            max_peak_value = overlapping_bursts[best_burst_idx]['peak_value']
+            if len([b for b in overlapping_bursts if b['peak_value'] == max_peak_value]) > 1:
+                txt = f"Warning: Multiple bursts have the same peak value of {max_peak_value:.2f} for SO starting at {so_s}. Selecting the one that is closest to the middle."
+                print()
+                with open('mapping_so_bursts_warning.txt', 'a') as f:
+                    f.write(txt) # TODO remove
+                so_midpoint = (so_s + so_e) / 2
+                best_burst_idx = np.argmin([abs(b['peak_index'] - so_midpoint) for b in overlapping_bursts if b['peak_value'] == max_peak_value])
             sigma_peaks_indices[i] = overlapping_bursts[best_burst_idx]['peak_index']
 
     return np.array(sigma_peaks_indices)
