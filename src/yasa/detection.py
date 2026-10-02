@@ -36,7 +36,14 @@ from .others import (
     get_event_indices,
 )
 from .spectral import stft_power
-from .bursts import detect_spindle_bursts, mapping_so_bursts
+from .bursts import (
+    detect_spindle_bursts, 
+    mapping_so_bursts,
+    get_all_candidate_bursts_by_mask,
+    calculate_bursts_median,
+    calculate_bursts_mad,
+    filter_bursts,
+)
 from .expanded_phase import get_sw_pha_unwrapped
 
 logger = logging.getLogger("yasa")
@@ -1457,7 +1464,14 @@ def sw_detect(
     amp_pos=(10, 150),
     amp_ptp=(75, 350),
     coupling=False,
-    coupling_params={"freq_sp": (12, 16), "burst_overlapping_so_criterion": 0.5, "expanded_phase": False},
+    coupling_params={
+        "freq_sp": (12, 16), 
+        "burst_overlapping_so_criterion": 0.5, 
+        "expanded_phase": False,
+        "burst_duration_range": (0.5, 2),
+        "min_bursts_distance": 500,
+        "z_peak_threshold": 1.5,
+    },
     remove_outliers=False,
     verbose=False,
 ):
@@ -1583,6 +1597,17 @@ def sw_detect(
         
         * ``expanded_phase`` is a boolean that defines whether we allows the coupling to occur beyond the duration of the slow-wave. 
         If False (default), the coupling is only calculated within the slow-wave event. If True, the coupling is calculated within half cycle before and after the slow-wave event.
+
+        * ``burst_duration_range`` : tuple or list
+        The minimum and maximum duration of the sigma bursts.
+        Default is 0.5 to 2 seconds.
+        
+        * ``min_distance`` : int
+        If two bursts are closer than ``min_distance`` (in ms), they are
+        merged into a single burst. Default is 500 ms.
+
+        * ``z_peak_threshold`` : float
+        The z-score threshold for the sigma peak amplitude. Default is 1.5.
 
     remove_outliers : boolean
         If True, YASA will automatically detect and remove outliers slow-waves
@@ -1718,13 +1743,21 @@ def sw_detect(
         # modulating lower frequency band (Aru et al. 2015).
         # https://doi.org/10.1016/j.conb.2014.08.002
         assert isinstance(coupling_params, dict)
-        assert "freq_sp" in coupling_params.keys()
+        assert "freq_sp" in coupling_params.keys() and len(coupling_params["freq_sp"]) == 2
         assert "burst_overlapping_so_criterion" in coupling_params.keys()
         assert "expanded_phase" in coupling_params.keys()
+        assert "min_bursts_distance" in coupling_params.keys()
+        assert "burst_duration_range" in coupling_params.keys()
+        assert "z_peak_threshold" in coupling_params.keys()
         assert "time" not in coupling_params.keys(), "`time` parameter was removed"
         assert "p" not in coupling_params.keys(), "`p` parameter was removed"
+        
         freq_sp = coupling_params["freq_sp"]
         expanded_phase = coupling_params["expanded_phase"]
+        burst_duration_range = coupling_params["burst_duration_range"]
+        z_peak_threshold = coupling_params["z_peak_threshold"]
+        min_bursts_distance = coupling_params["min_bursts_distance"]
+        
         data_sp = filter_data(
             data,
             sf,
@@ -1922,6 +1955,37 @@ def sw_detect(
             burst_starts, burst_ends, burst_peaks_indices = detect_spindle_bursts(
                 envelope=sp_amp[i, :],
                 sfreq=sf,
+            )
+            
+            assert times.shape[0] == sp_amp.shape[1] == data.shape[1], "Time vector, sp_amp[i], and data[i] must have the same length."
+            burst_peaks_original = burst_peaks_indices.copy()
+            burst_starts, burst_ends, burst_peaks_indices = get_all_candidate_bursts_by_mask(
+                burst_starts=burst_starts,
+                burst_ends=burst_ends,
+                burst_peaks_indices=burst_peaks_indices,
+                idx_included=idx_mask,
+            )
+            assert np.all((np.isin(burst_peaks_indices, burst_peaks_original))), "All burst peaks should be in the original burst peaks."
+            
+            median_sigma_burst_peak = calculate_bursts_median(
+                candidate_sigma_burst_peak_indices=burst_peaks_indices,
+                sigma_envelop=sp_amp[i, :],
+            )
+            mad_sigma_burst_peak = calculate_bursts_mad(
+                candidate_sigma_burst_peak_indices=burst_peaks_indices,
+                sigma_envelop=sp_amp[i, :],
+            )
+            burst_starts, burst_ends, burst_peaks_indices = filter_bursts(
+                sigma_envelop=sp_amp[i, :],
+                burst_starts=burst_starts,
+                burst_ends=burst_ends,
+                burst_peaks_indices=burst_peaks_indices,
+                median_sigma_burst_peak=median_sigma_burst_peak,
+                mad_sigma_burst_peak=mad_sigma_burst_peak,
+                burst_duration_range=burst_duration_range,
+                z_peak_threshold=z_peak_threshold,
+                min_bursts_distance=min_bursts_distance,
+                fs=sf,
             )
             
             burst_overlapping_so_criterion = coupling_params["burst_overlapping_so_criterion"]

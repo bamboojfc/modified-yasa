@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.signal import find_peaks
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 def detect_spindle_bursts(
     envelope: np.ndarray,
@@ -80,7 +81,7 @@ def detect_spindle_bursts(
     # --- for each peak, find its boundary
     burst_starts, burst_ends, peak_indices = [], [], []
     print(f"Mapping peaks to troughs and applying duration criteria (min={min_burst_duration:.2f}s, max={max_burst_duration:.2f}s)")
-    for _, each_peak_idx in enumerate(peak_idx):
+    for _, each_peak_idx in tqdm(enumerate(peak_idx)):
         if each_peak_idx == 0 or each_peak_idx == len(envelope) - 1:
             continue
         
@@ -186,3 +187,244 @@ def mapping_so_bursts(
             """
 
     return np.array(sigma_peaks_indices)
+
+def get_all_candidate_bursts_by_mask(
+        burst_starts: np.ndarray,
+        burst_ends: np.ndarray,
+        burst_peaks_indices: np.ndarray,
+        idx_included: np.ndarray,
+    ):
+    """
+    Get all candidate bursts by sleep stage.
+    
+    Parameters
+    ----------
+    burst_starts: np.ndarray
+        Sample indices of burst onsets (left troughs).
+    burst_ends: np.ndarray
+        Sample indices of burst offsets (right troughs).
+    burst_peaks_indices: np.ndarray
+        Sample indices of burst peaks (one per burst).
+    idx_included: np.ndarray
+        Sample indices of the included samples.
+    """
+    assert burst_starts.shape == burst_ends.shape == burst_peaks_indices.shape, "burst_starts, burst_ends, and burst_peaks_indices must have the same shape."
+
+    # Vectorized check: for each burst, check if ALL samples in [start, end] are included
+    keep = np.array([
+        idx_included[burst_starts[i]:burst_ends[i] + 1].all()
+        for i in range(len(burst_starts))
+    ])
+
+    print(f"Filtered bursts: {keep.sum()} out of {len(burst_starts)}")
+    return burst_starts[keep], burst_ends[keep], burst_peaks_indices[keep]
+
+def calculate_bursts_median(candidate_sigma_burst_peak_indices: np.ndarray, sigma_envelop: np.ndarray):
+    """
+    Calculate the median of the candidate sigma bursts' envelope values.
+    
+    Parameters
+    ----------
+    candidate_sigma_burst_peak_indices: np.ndarray
+        Sample indices of candidate sigma burst peaks.
+    sigma_envelop: np.ndarray
+        Envelope values of the sigma band (e.g., from Hilbert transform of bandpass-filtered signal).
+    
+    Returns
+    -------
+    median_burst_value: float
+        Median value of the candidate sigma bursts' envelope values.
+    """
+    
+    if len(candidate_sigma_burst_peak_indices) == 0:
+        return np.nan
+    
+    burst_values = sigma_envelop[candidate_sigma_burst_peak_indices]
+    median_burst_value = np.median(burst_values)
+    
+    return median_burst_value
+
+def calculate_bursts_mad(candidate_sigma_burst_peak_indices: np.ndarray, sigma_envelop: np.ndarray):
+    """
+    Calculate the median absolute deviation (MAD) of the candidate sigma bursts' envelope values.
+    
+    Parameters
+    ----------
+    candidate_sigma_burst_peak_indices: np.ndarray
+        Sample indices of candidate sigma burst peaks.
+    sigma_envelop: np.ndarray
+        Envelope values of the sigma band (e.g., from Hilbert transform of bandpass-filtered signal).
+    
+    Returns
+    -------
+    mad_burst_value: float
+        Median absolute deviation (MAD) value of the candidate sigma bursts' envelope values.
+    """
+    
+    if len(candidate_sigma_burst_peak_indices) == 0:
+        return np.nan
+    
+    burst_values = sigma_envelop[candidate_sigma_burst_peak_indices]
+    mad_burst_value = np.median(np.abs(burst_values - np.median(burst_values)))
+    
+    return mad_burst_value
+
+def filter_bursts(
+        sigma_envelop: np.ndarray,
+        burst_starts: np.ndarray,
+        burst_ends: np.ndarray,
+        burst_peaks_indices: np.ndarray,
+        median_sigma_burst_peak: float,
+        mad_sigma_burst_peak: float,
+        burst_duration_range: tuple[float, float],
+        z_peak_threshold: float,
+        min_bursts_distance: int,
+        fs: float,
+    ):
+    """
+    Filter bursts based on median and MAD of the candidate sigma bursts' envelope values, merge accpeted bursts with minimum_distance gap, and filter again by burst duration.
+    
+    Parameters
+    ----------
+    sigma_envelop: np.ndarray
+        Envelope values of the sigma band (e.g., from Hilbert transform of bandpass-filtered signal).
+    burst_starts: np.ndarray
+        Sample indices of burst onsets (left troughs).
+    burst_ends: np.ndarray
+        Sample indices of burst offsets (right troughs).
+    burst_peaks_indices: np.ndarray
+        Sample indices of burst peaks (one per burst).
+    median_sigma_burst_peak: float
+        Median value of the candidate sigma bursts' envelope values.
+    mad_sigma_burst_peak: float
+        Median absolute deviation (MAD) value of the candidate sigma bursts' envelope values.
+    burst_duration_range: tuple[float, float]
+        Minimum and maximum burst duration in seconds.
+    z_peak_threshold: float
+        Z-score threshold for filtering bursts based on their peak envelope values.
+    min_bursts_distance: int (ms)
+        selected bursts with less than min_bursts_distance ms between them will be merged into one burst.
+    fs: float
+        Sampling frequency in Hz.
+    """
+    
+    # Calculate z-score threshold
+    peaks_z_score = (sigma_envelop[burst_peaks_indices] - median_sigma_burst_peak) / (1.4826 * mad_sigma_burst_peak) # 1.4826 is the standard scaling factor for data that follows a normal distribution
+    
+    bursts_included = np.where(peaks_z_score >= z_peak_threshold)[0]
+    print(f"Bursts included after z-score filtering: {len(bursts_included)} out of {len(burst_peaks_indices)}")
+    
+    burst_starts_filtered = burst_starts[bursts_included]
+    burst_ends_filtered = burst_ends[bursts_included]
+    burst_peaks_indices_filtered = burst_peaks_indices[bursts_included]
+    
+    # Merge bursts that are closer than min_bursts_distance
+    min_bursts_distance = int(min_bursts_distance * 0.001 * fs)  # convert ms to samples
+    merged_burst_starts = []
+    merged_burst_ends = []
+    merged_burst_peaks_indices = []
+    for i in range(len(burst_starts_filtered)):
+        if len(merged_burst_starts) == 0:
+            merged_burst_starts.append(burst_starts_filtered[i])
+            merged_burst_ends.append(burst_ends_filtered[i])
+            merged_burst_peaks_indices.append(burst_peaks_indices_filtered[i])
+        else:
+            if burst_starts_filtered[i] - merged_burst_ends[-1] <= min_bursts_distance:
+                # Merge bursts
+                merged_burst_ends[-1] = max(merged_burst_ends[-1], burst_ends_filtered[i])
+                if sigma_envelop[burst_peaks_indices_filtered[i]] > sigma_envelop[merged_burst_peaks_indices[-1]]:
+                    merged_burst_peaks_indices[-1] = burst_peaks_indices_filtered[i]
+            else:
+                merged_burst_starts.append(burst_starts_filtered[i])
+                merged_burst_ends.append(burst_ends_filtered[i])
+                merged_burst_peaks_indices.append(burst_peaks_indices_filtered[i])
+    
+    merged_burst_starts = np.array(merged_burst_starts)
+    merged_burst_ends = np.array(merged_burst_ends)
+    merged_burst_peaks_indices = np.array(merged_burst_peaks_indices)
+    assert len(merged_burst_starts) == len(merged_burst_ends) == len(merged_burst_peaks_indices), "Merged bursts lists must have the same length."
+    print(f"Number of bursts merging: {len(merged_burst_starts)}")
+    
+    # Filter bursts by duration
+    burst_durations = (np.array(merged_burst_ends) - np.array(merged_burst_starts)) / fs
+    duration_mask = (burst_durations >= burst_duration_range[0]) & (burst_durations <= burst_duration_range[1])
+    burst_starts_final = merged_burst_starts[duration_mask]
+    burst_ends_final = merged_burst_ends[duration_mask]
+    burst_peaks_indices_final = merged_burst_peaks_indices[duration_mask]
+    print(f"Bursts included after duration filtering: {len(burst_starts_final)} out of {len(merged_burst_starts)}")
+    assert len(burst_starts_final) == len(burst_ends_final) == len(burst_peaks_indices_final), "Final bursts lists must have the same length."
+
+    """
+    _plot_bursts(
+        sigma_envelop=sigma_envelop,
+        burst_starts=burst_starts,
+        burst_ends=burst_ends,
+        burst_peaks_indices=burst_peaks_indices,
+        burst_starts_filtered=burst_starts_filtered,
+        burst_ends_filtered=burst_ends_filtered,
+        burst_peaks_indices_fliltered=burst_peaks_indices_filtered,
+        merged_burst_starts=merged_burst_starts,
+        merged_burst_ends=merged_burst_ends,
+        merged_burst_peaks_indices=merged_burst_peaks_indices,
+        burst_starts_final=burst_starts_final,
+        burst_ends_final=burst_ends_final,
+        burst_peaks_indices_final=burst_peaks_indices_final,
+        fs=fs,    
+    )
+    """
+    
+    return burst_starts_final, burst_ends_final, burst_peaks_indices_final
+
+def _plot_bursts(
+        sigma_envelop: np.ndarray,
+        burst_starts: np.ndarray,
+        burst_ends: np.ndarray,
+        burst_peaks_indices: np.ndarray,
+        burst_starts_filtered: np.ndarray,
+        burst_ends_filtered: np.ndarray,
+        burst_peaks_indices_fliltered: np.ndarray,
+        merged_burst_starts: np.ndarray,
+        merged_burst_ends: np.ndarray,
+        merged_burst_peaks_indices: np.ndarray,
+        burst_starts_final: np.ndarray,
+        burst_ends_final: np.ndarray,
+        burst_peaks_indices_final: np.ndarray,
+        fs: float,
+    ):
+    """
+    Plot each step result to check if the filtering is working correctly.
+    """
+    window_size = int(fs * 30)  # 30 seconds window
+    
+    def _plot_bursts_in_window(ax, idx, window_size, burst_starts, burst_ends, burst_peaks_indices, color='red'):
+        ax.plot(np.arange(idx, idx+window_size, dtype=int), sigma_envelop[idx:idx + window_size], color='gray', label='Sigma Envelope')
+        _peak_indices = burst_peaks_indices[(burst_peaks_indices >= idx) & (burst_peaks_indices < idx + window_size)]
+        ax.scatter(_peak_indices, sigma_envelop[_peak_indices], color=color)
+        
+        for _sampling_idx in range(idx, idx + window_size):
+            if _sampling_idx in burst_starts:
+                ax.axvline(x=_sampling_idx, color='black', linestyle='--')
+            if _sampling_idx in burst_ends:
+                ax.axvline(x=_sampling_idx, color='black', linestyle='-')
+        
+    
+    for idx in range(0, len(sigma_envelop), window_size):
+        fig, ax = plt.subplots(4, 1, sharex=True, figsize=(15, 10))
+        
+        _plot_bursts_in_window(ax[0], idx, window_size, burst_starts, burst_ends, burst_peaks_indices, color='red')
+        ax[0].set_title('Original Bursts')
+        
+        _plot_bursts_in_window(ax[1], idx, window_size, burst_starts_filtered, burst_ends_filtered, burst_peaks_indices_fliltered, color='blue')
+        ax[1].set_title('Filtered Bursts (Z-score)')
+        
+        _plot_bursts_in_window(ax[2], idx, window_size, merged_burst_starts, merged_burst_ends, merged_burst_peaks_indices, color='green')
+        ax[2].set_title('Merged Bursts')
+        
+        _plot_bursts_in_window(ax[3], idx, window_size, burst_starts_final, burst_ends_final, burst_peaks_indices_final, color='purple')
+        ax[3].set_title('Final Bursts (Duration Filtered)')
+        
+        fig.tight_layout()
+        plt.show()
+        
+        if input("Press Enter to continue to the next segment, or type 'q' to quit plotting: ") == 'q':
+            break
